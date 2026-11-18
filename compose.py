@@ -1,279 +1,391 @@
 #!/usr/bin/env python3
-"""Compose 'THE WORLD TODAY' — vintage broadsheet front page, 1024x1024 PNG.
-Same navy format as the 18 November edition: huge masthead, info bar between
-double rules, giant BREAKING NEWS banner, lead story with photo right / text
-left and a pull-quote box, then four stories in columns below. Navy ink
-throughout; the spot art is graded to a navy-on-cream duotone in-process so
-the whole page reads as one printed sheet. All text is rendered
-programmatically with PIL; display text is placed by its measured ink box so
-nothing overlaps."""
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
+"""
+THE WORLD TODAY -- a one-page broadsheet for Tuesday 17 November 2026.
+
+This module paints a 1024 x 1024 navy-on-cream front page with PIL.
+The page is assembled from the copy deck further down plus five
+engraved plates that live beside this file (art_*.png).  No network
+access is needed and repeated runs produce identical bytes.
+
+Layout is planned in "units" (one unit = one output pixel) while the
+canvas is rasterised at twice that size and shrunk at the end, which
+keeps the small serif type crisp at thumbnail scale.
+"""
+
 import os
 
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# ------------------------------------------------------------------ ink
+PAPER = (247, 242, 223)        # warm cream of the sheet itself
+PAPER_HI = (250, 246, 230)     # brightest tone inside a plate
+NAVY = (22, 41, 77)            # headline navy
+INK = (17, 34, 66)             # slightly deeper navy for running text
+NAVY_DEEP = (10, 22, 45)       # shadow tone inside a plate
+NAVY_HALF = (86, 108, 150)     # halftone mid inside a plate
+
+# ------------------------------------------------------------------ type
 NOTO = "/usr/share/fonts/truetype/noto"
-COND_BLACK = f"{NOTO}/NotoSansDisplay-CondensedBlack.ttf"
-SERIF_BLACK = f"{NOTO}/NotoSerif-Black.ttf"
-SERIF_REG = f"{NOTO}/NotoSerif-Regular.ttf"
-SERIF_IT = f"{NOTO}/NotoSerif-Italic.ttf"
-SANS_BOLD = f"{NOTO}/NotoSans-Bold.ttf"
+F_DISPLAY = os.path.join(NOTO, "NotoSerifDisplay-Black.ttf")
+F_BLACK = os.path.join(NOTO, "NotoSerif-Black.ttf")
+F_SERIF = os.path.join(NOTO, "NotoSerif-Regular.ttf")
+F_SERIF_IT = os.path.join(NOTO, "NotoSerif-Italic.ttf")
+F_SANS_B = os.path.join(NOTO, "NotoSans-Bold.ttf")
 
-W = H = 1024
-PAPER = (248, 244, 234)
-NAVY = (22, 41, 77)          # #16294d
-INK = (24, 24, 28)
-GREY = (96, 94, 86)
-LGREY = (198, 194, 184)
+PAGE = 1024                    # final square edge, pixels
+SS = 2                         # supersampling factor while drawing
 
-img = Image.new("RGB", (W, H), PAPER)
-d = ImageDraw.Draw(img)
+_cache = {}
 
 
-def font(path, size):
-    return ImageFont.truetype(path, size)
+def face(path, size_units):
+    """Cached TrueType face at a size given in page units."""
+    px = max(4, int(round(size_units * SS)))
+    key = (path, px)
+    if key not in _cache:
+        _cache[key] = ImageFont.truetype(path, px)
+    return _cache[key]
 
 
-def text_w(f, s):
-    return d.textlength(s, font=f)
+class Press:
+    """A drawing surface that speaks in page units, not raw pixels."""
 
+    def __init__(self):
+        self.sheet = Image.new("RGB", (PAGE * SS, PAGE * SS), PAPER)
+        self.pen = ImageDraw.Draw(self.sheet)
 
-def ink(f, s):
-    """(top_offset, ink_height) of string s in font f."""
-    b = d.textbbox((0, 0), s, font=f)
-    return b[1], b[3] - b[1]
+    @staticmethod
+    def px(v):
+        return int(round(v * SS))
 
+    # ---------------------------------------------------------- rules
+    def hline(self, x0, x1, y, weight=1.2, tone=NAVY):
+        self.pen.line([self.px(x0), self.px(y), self.px(x1), self.px(y)],
+                      fill=tone, width=max(1, self.px(weight)))
 
-def fit_font(path, s, max_w, start, minimum=10):
-    size = start
-    while size > minimum:
-        f = font(path, size)
-        if text_w(f, s) <= max_w:
-            return f, size
-        size -= 1
-    return font(path, minimum), minimum
+    def vline(self, x, y0, y1, weight=1.0, tone=NAVY):
+        self.pen.line([self.px(x), self.px(y0), self.px(x), self.px(y1)],
+                      fill=tone, width=max(1, self.px(weight)))
 
+    def frame(self, x, y, w, h, weight=1.4, tone=NAVY):
+        self.pen.rectangle([self.px(x), self.px(y), self.px(x + w),
+                            self.px(y + h)], outline=tone,
+                           width=max(1, self.px(weight)))
 
-def wrap(f, s, max_w):
-    words, lines, cur = s.split(), [], ""
-    for w_ in words:
-        t = (cur + " " + w_).strip()
-        if text_w(f, t) <= max_w:
-            cur = t
-        else:
-            if cur:
+    def slab(self, x, y, w, h, tone=NAVY):
+        self.pen.rectangle([self.px(x), self.px(y), self.px(x + w),
+                            self.px(y + h)], fill=tone)
+
+    # ---------------------------------------------------------- words
+    def width_of(self, s, fnt, tracking=0.0):
+        w = self.pen.textlength(s, font=fnt) / SS
+        if tracking and len(s) > 1:
+            w += tracking * (len(s) - 1)
+        return w
+
+    def put(self, x, y, s, fnt, tone=INK, tracking=0.0):
+        """Draw one line; returns the advance width in units."""
+        if not tracking:
+            self.pen.text((self.px(x), self.px(y)), s, font=fnt, fill=tone)
+            return self.width_of(s, fnt)
+        cx = x
+        for ch in s:
+            self.pen.text((self.px(cx), self.px(y)), ch, font=fnt, fill=tone)
+            cx += self.pen.textlength(ch, font=fnt) / SS + tracking
+        return cx - x - tracking
+
+    def put_centred(self, cx, y, s, fnt, tone=INK, tracking=0.0):
+        return self.put(cx - self.width_of(s, fnt, tracking) / 2.0,
+                        y, s, fnt, tone, tracking)
+
+    def wrap(self, s, fnt, max_w):
+        """Greedy word wrap measured against max_w units."""
+        lines, cur = [], ""
+        for word in s.split():
+            trial = word if not cur else cur + " " + word
+            if not cur or self.width_of(trial, fnt) <= max_w:
+                cur = trial
+            else:
                 lines.append(cur)
-            cur = w_
-    if cur:
-        lines.append(cur)
-    return lines
+                cur = word
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def paragraph(self, x, y, s, fnt, max_w, leading, tone=INK):
+        """Draw wrapped text; returns the y just past its last line."""
+        lines = self.wrap(s, fnt, max_w)
+        for i, ln in enumerate(lines):
+            self.put(x, y + i * leading, ln, fnt, tone)
+        return y + len(lines) * leading
+
+    def paste(self, img, x, y):
+        self.sheet.paste(img, (self.px(x), self.px(y)))
+
+    def finish(self):
+        return self.sheet.resize((PAGE, PAGE), Image.LANCZOS)
 
 
-def center_ink(y, s, f, fill=NAVY):
-    """Draw s horizontally centered with its ink top at y; return ink bottom."""
-    off, ih = ink(f, s)
-    d.text(((W - text_w(f, s)) / 2, y - off), s, font=f, fill=fill)
-    return y + ih
+def shrink_to_fit(press, s, path, want, floor, max_w, tracking=0.0):
+    """Largest size <= want at which s still fits max_w on one line."""
+    size = want
+    while size > floor:
+        fnt = face(path, size)
+        if press.width_of(s, fnt, tracking) <= max_w:
+            return size, fnt
+        size -= 0.5
+    return floor, face(path, floor)
 
 
-def left_ink(x, y, s, f, fill=NAVY):
-    off, ih = ink(f, s)
-    d.text((x, y - off), s, font=f, fill=fill)
-    return y + ih
+def plate(filename, w_units, h_units, focus=0.5):
+    """Crop an engraving to its slot and grade it to a navy duotone.
+
+    Luminance is squeezed through a short tonal ladder first, which
+    gives the pictures a printed, letterpress feel and keeps the
+    five plates reading as one family on the sheet.
+    """
+    src = Image.open(os.path.join(HERE, filename)).convert("L")
+    tw, th = Press.px(w_units), Press.px(h_units)
+    scale = max(tw / src.width, th / src.height)
+    src = src.resize((round(src.width * scale), round(src.height * scale)),
+                     Image.LANCZOS)
+    left = max(0, (src.width - tw) // 2)
+    top = min(max(0, int((src.height - th) * focus)), src.height - th)
+    src = src.crop((left, top, left + tw, top + th))
+    src = ImageOps.autocontrast(src, cutoff=1)
+    rungs = 44
+    ladder = [int(round(round(v / 255.0 * (rungs - 1)) / (rungs - 1) * 255))
+              for v in range(256)]
+    src = src.point(ladder)
+    return ImageOps.colorize(src, black=NAVY_DEEP, mid=NAVY_HALF,
+                             white=PAPER_HI)
 
 
-def double_rule(y, w_top=2, w_bot=5, gap=3):
-    d.line([(M, y), (W - M, y)], fill=NAVY, width=w_top)
-    d.line([(M, y + w_top + gap), (W - M, y + w_top + gap)], fill=NAVY, width=w_bot)
-    return y + w_top + gap + w_bot
+# ------------------------------------------------------------------ copy
+MASTHEAD = "THE WORLD TODAY"
+INFOBAR = "VOL. 1 · NO. 323 • TUESDAY, 17 NOVEMBER 2026 • ONE DAY · ONE PAGE"
+BANNER = "BREAKING NEWS"
 
+LEAD = {
+    "kicker": "LEAD STORY — SHENZHEN, CHINA",
+    "headline": "THREE LEADERS, ONE TABLE",
+    "body": (
+        "Beijing has made it official: on Thursday, Xi Jinping hosts "
+        "Donald Trump and Vladimir Putin in Shenzhen — the first time "
+        "the leaders of America, China and Russia have ever met in one "
+        "room. Washington and Moscow had already said yes; China's word "
+        "ends the suspense. Nuclear arms top the agenda."
+    ),
+    "quote": "“The beginning of a dialogue that we hope will be "
+             "productive in the future.”",
+    "attribution": "A U.S. OFFICIAL, ON THURSDAY'S TALKS",
+    "art": "art_summit.png",
+    "caption": (
+        "Shenzhen hosts APEC's 21 economies this week — and on "
+        "Thursday the world's three biggest nuclear powers take "
+        "their seats at one table."
+    ),
+}
 
-def duotone(im):
-    """Grade a colour illustration to the page's navy-on-cream print palette:
-    autocontrast, posterize to stepped tones (a woodcut feel), then ramp
-    shadow -> steel -> paper."""
-    g = ImageOps.autocontrast(im.convert("L"), cutoff=1)
-    g = ImageOps.posterize(g, 3)
-    lut = []
-    mid = (96, 116, 152)
-    for i in range(256):
-        t = i / 255.0
-        if t < 0.5:
-            u = t / 0.5
-            rgb = tuple(round(NAVY[c] + (mid[c] - NAVY[c]) * u) for c in range(3))
-        else:
-            u = (t - 0.5) / 0.5
-            rgb = tuple(round(mid[c] + (PAPER[c] - mid[c]) * u) for c in range(3))
-        lut.extend(rgb)
-    return Image.merge("RGB", [g.point(lut[c::3]) for c in range(3)])
-
-
-def paste_cover(path, box, fy=0.5, inset=0.0):
-    im = Image.open(path).convert("RGB")
-    if inset:
-        iw, ih = im.size
-        im = im.crop((int(iw * inset), int(ih * inset),
-                      int(iw * (1 - inset)), int(ih * (1 - inset))))
-    im = duotone(im)
-    bw, bh = box[2] - box[0], box[3] - box[1]
-    scale = max(bw / im.width, bh / im.height)
-    im = im.resize((round(im.width * scale), round(im.height * scale)),
-                   Image.LANCZOS)
-    im = im.filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=2))
-    x = (im.width - bw) // 2
-    yy = int((im.height - bh) * fy)
-    im = im.crop((x, yy, x + bw, yy + bh))
-    img.paste(im, (box[0], box[1]))
-    d.rectangle(box, outline=NAVY, width=2)
-
-
-def block_text(x, y, lines, f, lh, fill=INK):
-    for ln in lines:
-        d.text((x, y), ln, font=f, fill=fill)
-        y += lh
-    return y
-
-
-M = 26
-CW = W - 2 * M               # 972
-
-# ---------------- Top double rule + masthead ----------------
-y = double_rule(12)                                   # ends 22
-f_mast, ms = fit_font(COND_BLACK, "THE WORLD TODAY", CW, 150)
-y = center_ink(28, "THE WORLD TODAY", f_mast)         # ink bottom ~118
-print("masthead size", ms, "ink bottom", y)
-
-# ---------------- Info bar between double rules ----------------
-y = double_rule(y + 4, w_top=5, w_bot=2)
-f_info = font(SANS_BOLD, 19)
-info = "VOL. 1 \u00b7 NO. 323    *    TUESDAY, 17 NOVEMBER 2026    *    ONE DAY \u00b7 ONE PAGE"
-y = center_ink(y + 6, info, f_info)
-y = double_rule(y + 6, w_top=2, w_bot=5)
-print("after info bar", y)
-
-# ---------------- BREAKING NEWS banner ----------------
-f_ban, bs = fit_font(COND_BLACK, "BREAKING NEWS", CW, 122)
-y = center_ink(y + 10, "BREAKING NEWS", f_ban)
-print("banner size", bs, "ink bottom", y)
-y = double_rule(y + 4, w_top=5, w_bot=2)
-
-# ---------------- LEAD block ----------------
-LEAD_Y = y + 10
-LX, LW = M, 462                    # left text column
-RX = M + LW + 18                   # 506
-RW = W - M - RX                    # 492
-
-f_kick = font(SANS_BOLD, 17)
-ky = left_ink(LX, LEAD_Y, "LEAD STORY \u2014 SHENZHEN, CHINA", f_kick)
-f_lh, lhs = fit_font(COND_BLACK, "THREE LEADERS, ONE TABLE", LW, 64)
-hy = left_ink(LX, ky + 8, "THREE LEADERS, ONE TABLE", f_lh)
-print("lead headline size", lhs)
-print("lead headline bottom", hy)
-f_body = font(SERIF_REG, 19)
-lead_body = ("Beijing has confirmed it: on Thursday, Xi Jinping hosts Donald "
-             "Trump and Vladimir Putin in Shenzhen \u2014 the first time the "
-             "American, Chinese and Russian leaders have ever met. Washington "
-             "and Moscow had already said yes; China's word makes it "
-             "official. Nuclear arms top the agenda.")
-lead_lines = wrap(f_body, lead_body, LW)
-by = block_text(LX, hy + 10, lead_lines, f_body, 21)
-print("lead body lines", len(lead_lines), "ends", by)
-
-qy = by + 8
-f_quote = font(SERIF_IT, 20)
-quote = ("\u201cSafeguarding world peace and promoting strategic "
-         "stability among major powers.\u201d \u2014 China's Foreign Ministry")
-qlines = wrap(f_quote, quote, LW - 30)
-qh = len(qlines) * 23 + 14
-d.rectangle([LX, qy, LX + LW, qy + qh], outline=NAVY, width=3)
-block_text(LX + 15, qy + 7, qlines, f_quote, 23, fill=NAVY)
-LEAD_END = qy + qh
-
-paste_cover(f"{HERE}/art_summit.png", (RX, LEAD_Y, RX + RW, LEAD_Y + 250), fy=0.40)
-f_cap = font(SERIF_IT, 17)
-cap = ("Shenzhen hosts APEC's 21 leaders this week \u2014 and on Thursday "
-       "its three biggest nuclear powers sit down together.")
-cy = LEAD_Y + 258
-for ln in wrap(f_cap, cap, RW):
-    d.text((RX, cy), ln, font=f_cap, fill=GREY)
-    cy += 21
-LEAD_END = max(LEAD_END, cy)
-print("lead ends", LEAD_END)
-assert LEAD_END <= 648, LEAD_END
-
-# ---------------- Rule + four story columns ----------------
-RY = LEAD_END + 10
-d.line([(M, RY), (W - M, RY)], fill=NAVY, width=2)
-SY = RY + 10
-COLW = (CW - 3 * 16) // 4          # 231
-COLS_X = [M + i * (COLW + 16) for i in range(4)]
-ART_H = 38
-
-stories = [
-    ("UKRAINE DROPS PUTIN'S CRIMEA BRIDGE", "art_bridge.png", 0.82,
-     "After a seven-stage operation, Ukraine's drones and Flamingo and "
-     "Neptune missiles dropped the road arch of the Kerch Bridge "
-     "\u2014 Putin's lifeline to Crimea \u2014 into the strait. Russia "
-     "answered: seven ballistic missiles smashed Kyiv's North and South "
-     "bridges, killing at least two people."),
-    ("TANKERS BURN IN THE STRAIT OF HORMUZ", "art_hormuz.png", 0.38,
-     "Iranian drones targeted a US radar in Bahrain \u2014 Manama says "
-     "all were intercepted \u2014 and US jets hit a Guards missile site "
-     "on Qeshm. Tankers burned: Tara Gas hit twice; an ADNOC crewman is "
-     "missing, 11 hurt. Tehran blames its mines; Washington calls it "
-     "psychological warfare."),
-    ("WEST TO ISRAEL: OPEN GAZA'S GATES", "art_gaza.png", 0.40,
-     "Four Western governments spoke as one: Britain, Australia, Canada "
-     "and Italy called on Israel to open Gaza's crossings to unrestricted "
-     "aid at once. They called the Strip's situation catastrophic, as "
-     "winter flooding deepens the misery of families in tents and ruins."),
-    ("YEMEN'S ARMY FALLS BACK ON ADEN", "art_yemen.png", 0.45,
-     "A second front is moving. Yemen's government has pulled its "
-     "forces off the Red Sea coast to defend Aden against advancing "
-     "Houthi fighters, while Saudi jets struck Houthi positions near "
-     "Saada. The retreat leaves the rebels closer to Bab el-Mandeb, "
-     "gateway to the Red Sea."),
+COLUMNS = [
+    {
+        "art": "art_bridge.png",
+        "focus": 0.40,
+        "headline": "UKRAINE DROPS PUTIN'S CRIMEA BRIDGE",
+        "body": (
+            "The seventh stage of the operation did it: Ukrainian "
+            "drones smashed the road section of the Kerch Bridge "
+            "while Neptune missiles hit the rail line, dropping an "
+            "arch and its span into the strait's only shipping "
+            "channel. Moscow answered with seven ballistic missiles "
+            "on Kyiv's two river bridges, killing at least two people."
+        ),
+    },
+    {
+        "art": "art_hormuz.png",
+        "focus": 0.45,
+        "headline": "TANKERS BURN IN THE STRAIT OF HORMUZ",
+        "body": (
+            "Iran's Revolutionary Guards sent drones at a US radar "
+            "at Bahrain's Sheikh Isa air base; Manama and Washington "
+            "say all were intercepted, with no damage done. US jets "
+            "answered by striking a Guards missile site "
+            "on Qeshm Island. At sea, a supertanker and a gas carrier "
+            "burned after striking mines; one seafarer is missing."
+        ),
+    },
+    {
+        "art": "art_gaza.png",
+        "focus": 0.55,
+        "headline": "WEST TO ISRAEL: OPEN GAZA'S GATES",
+        "body": (
+            "Four governments spoke as one: Britain, Australia, "
+            "Canada and Italy urged Israel to stop the delays and "
+            "open Gaza's crossings to aid at once. Some 150,000 tents "
+            "sit held at the border while the first winter storm has "
+            "swept away tens of thousands of shelters. The ministers "
+            "called the misery catastrophic — and reversible."
+        ),
+    },
+    {
+        "art": "art_yemen.png",
+        "focus": 0.45,
+        "headline": "YEMEN'S ARMY FALLS BACK ON ADEN",
+        "body": (
+            "A second front is moving. Yemen's government has pulled "
+            "its forces off the Red Sea coast and the Bab el-Mandeb "
+            "shore to defend Aden, after Houthi fighters seized "
+            "ground in Lahj, some 60 kilometres away. Saudi jets "
+            "struck near Saada and Sanaa — but the coast is slipping "
+            "from the government's grip."
+        ),
+    },
 ]
 
-f_col_h = font(SERIF_BLACK, 20)
-f_col_b = font(SERIF_REG, 17)
-head_wrapped = [wrap(f_col_h, s[0], COLW) for s in stories]
-HZONE = max(len(h) for h in head_wrapped) * 21
-BODY_Y = SY + ART_H + 8 + HZONE + 2
-print("headline zone", HZONE, "body starts", BODY_Y)
-for i, (head, art, fy_, body) in enumerate(stories):
-    x = COLS_X[i]
-    paste_cover(f"{HERE}/{art}", (x, SY, x + COLW, SY + ART_H), fy=fy_)
-    block_text(x, SY + ART_H + 8, head_wrapped[i], f_col_h, 21, fill=NAVY)
-    blines = wrap(f_col_b, body, COLW)
-    bend = block_text(x, BODY_Y, blines, f_col_b, 19)
-    print("col", i, head[:18], "body lines", len(blines), "ends", bend)
-    assert bend <= 950, (i, bend)
-    if i < 3:
-        dx = x + COLW + 8
-        d.line([(dx, SY), (dx, 948)], fill=LGREY, width=1)
+ALSO_TODAY = (
+    "ALSO TODAY — Japan scrambles jets over a Russian airspace "
+    "violation · 146,000 march in France's living-cost protests · "
+    "COP31 ministers take over in Antalya, draft deal under fire"
+)
 
-# ---------------- Footer: navy ALSO TODAY strip ----------------
-FY = 956
-f_also = font(SANS_BOLD, 17)
-also = ("ALSO TODAY \u2014 Japan scrambles jets over Russian airspace "
-        "violation \u00b7 146,000 march in France's fourth weekend of "
-        "living-cost protests \u00b7 COP31 ministers take over in Antalya, "
-        "draft deal under fire")
-alines = wrap(f_also, also, CW - 36)
-AH = len(alines) * 21 + 12
-assert FY + AH <= H - 8, (FY, AH)
-d.rectangle([M, FY, W - M, FY + AH], fill=NAVY)
-yy = FY + 6
-for ln in alines:
-    d.text(((W - text_w(f_also, ln)) / 2, yy), ln, font=f_also, fill=PAPER)
-    yy += 21
 
-out = f"{HERE}/entry.png"
-img.save(out, optimize=True)
-size = os.path.getsize(out)
-print("saved", out, img.size, size, "bytes; also lines:", len(alines))
-if size > 1024 * 1024:
-    q = img.quantize(colors=256, method=Image.MEDIANCUT,
-                     dither=Image.FLOYDSTEINBERG)
-    q.save(out, optimize=True)
-    print("quantized ->", os.path.getsize(out), "bytes")
+# ------------------------------------------------------------------ bands
+def story_column(p, x, w, top, bottom, item):
+    """One news column: plate strip, headline, then fitted body copy."""
+    p.paste(plate(item["art"], w, 46, focus=item.get("focus", 0.45)),
+            x, top)
+    p.frame(x, top, w, 46, weight=1.3)
+
+    y = top + 46 + 7
+    size = 20.5
+    lines = []
+    while size > 14.0:
+        fnt = face(F_BLACK, size)
+        lines = p.wrap(item["headline"], fnt, w)
+        if len(lines) <= 3:
+            break
+        size -= 0.5
+    step = size * 1.13
+    for i, ln in enumerate(lines):
+        p.put(x, y + i * step, ln, fnt, NAVY)
+    y += len(lines) * step + 7
+
+    size = 15.0
+    while size > 12.0:
+        fnt = face(F_SERIF, size)
+        lines = p.wrap(item["body"], fnt, w)
+        if y + len(lines) * size * 1.20 <= bottom:
+            break
+        size -= 0.5
+    step = size * 1.20
+    if lines and y + len(lines) * step > bottom:
+        step = (bottom - y) / len(lines)
+    for i, ln in enumerate(lines):
+        p.put(x, y + i * step, ln, fnt, INK)
+    return y + len(lines) * step
+
+
+def lead_block(p, x, y, w_text, art_x, art_w):
+    """The lead story: text column left, framed plate right."""
+    p.put(x, y, LEAD["kicker"], face(F_SANS_B, 15), NAVY, tracking=1.6)
+
+    hy = y + 25
+    size = 43.0
+    while size > 30.0:
+        fnt = face(F_BLACK, size)
+        lines = p.wrap(LEAD["headline"], fnt, w_text)
+        if len(lines) <= 2:
+            break
+        size -= 0.5
+    step = size * 1.05
+    for i, ln in enumerate(lines):
+        p.put(x, hy + i * step, ln, fnt, NAVY)
+
+    by = hy + len(lines) * step + 9
+    body_end = p.paragraph(x, by, LEAD["body"], face(F_SERIF, 18),
+                           w_text, 22.5, INK)
+
+    qy = body_end + 7
+    qf = face(F_SERIF_IT, 16.5)
+    qlines = p.wrap(LEAD["quote"], qf, w_text - 26)
+    qh = 10 + len(qlines) * 21.5 + 18
+    p.frame(x, qy, w_text, qh, weight=1.6)
+    for i, ln in enumerate(qlines):
+        p.put(x + 13, qy + 9 + i * 21.5, ln, qf, INK)
+    p.put(x + 13, qy + qh - 17, LEAD["attribution"],
+          face(F_SANS_B, 10.5), NAVY, tracking=1.0)
+
+    art_h = 258
+    p.paste(plate(LEAD["art"], art_w, art_h, focus=0.42), art_x, y)
+    p.frame(art_x, y, art_w, art_h, weight=2.2)
+    p.paragraph(art_x, y + art_h + 9, LEAD["caption"],
+                face(F_SERIF_IT, 14.5), art_w, 19.5, INK)
+    return qy + qh
+
+
+def build_front_page():
+    p = Press()
+    M = 26.0
+    W = PAGE - 2 * M
+    cx = PAGE / 2.0
+
+    # -- masthead ------------------------------------------------------
+    msize, mfnt = shrink_to_fit(p, MASTHEAD, F_DISPLAY, 122, 60, W)
+    p.put_centred(cx, 4, MASTHEAD, mfnt, NAVY)
+    y = 4 + msize * 1.05
+    p.hline(M, PAGE - M, y, 4.2)
+    p.hline(M, PAGE - M, y + 6.5, 1.4)
+    y += 14
+
+    # -- info bar ------------------------------------------------------
+    p.put_centred(cx, y, INFOBAR, face(F_SANS_B, 15.5), NAVY,
+                  tracking=1.1)
+    y += 25
+    p.hline(M, PAGE - M, y, 1.4)
+    p.hline(M, PAGE - M, y + 5, 4.2)
+    y += 11
+
+    # -- banner --------------------------------------------------------
+    bsize, bfnt = shrink_to_fit(p, BANNER, F_DISPLAY, 118, 60, W)
+    p.put_centred(cx, y, BANNER, bfnt, NAVY)
+    y += bsize * 1.05 + 3
+    p.hline(M, PAGE - M, y, 4.2)
+    p.hline(M, PAGE - M, y + 6.5, 1.4)
+    y += 15
+
+    # -- lead ----------------------------------------------------------
+    lead_end = lead_block(p, M, y, 444, M + 462, PAGE - M - (M + 462))
+    y = max(lead_end, y + 300) + 12
+    p.hline(M, PAGE - M, y, 2.0)
+    y += 12
+
+    # -- four columns --------------------------------------------------
+    col_bottom = 946
+    gap = 14
+    cw = (W - 3 * gap) / 4.0
+    for i, item in enumerate(COLUMNS):
+        x = M + i * (cw + gap)
+        if i:
+            p.vline(x - gap / 2.0, y, col_bottom, weight=0.9)
+        story_column(p, x, cw, y, col_bottom, item)
+
+    # -- also today strip ----------------------------------------------
+    sy, sh = 958, 44
+    p.slab(M, sy, W, sh)
+    sfnt = face(F_SANS_B, 14.5)
+    lines = p.wrap(ALSO_TODAY, sfnt, W - 36)
+    step = 16.5
+    ty = sy + (sh - ((len(lines) - 1) * step + 15)) / 2.0
+    for i, ln in enumerate(lines):
+        p.put_centred(cx, ty + i * step, ln, sfnt, PAPER)
+
+    return p.finish()
+
+
+if __name__ == "__main__":
+    img = build_front_page()
+    out = os.path.join(HERE, "entry.png")
+    img.save(out)
+    print("wrote", out, img.size, os.path.getsize(out), "bytes")

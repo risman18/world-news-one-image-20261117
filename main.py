@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Deliver the finished front page: copy entry.png to /output/entry.png.
-
-The output is a byte-identical copy of the entry.png stored next to
-this script in the repository root, so every run produces exactly
-the same file. Standard library only; no network access.
 """
-import shutil
-from pathlib import Path
+Entry point for the news-image-20261117 submission.
 
-ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "entry.png"
-DST_DIR = Path("/output")
-DST = DST_DIR / "entry.png"
+Renders the front page built by compose.py and writes it to
+/output/entry.png.  Runs fully offline; the only inputs are the
+files in this repository.
+"""
+
+import os
+
+from compose import build_front_page
+
+OUT_DIR = "/output"
+OUT_FILE = "entry.png"
 
 
-def main() -> None:
-    DST_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(SRC, DST)
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    page = build_front_page()
+    page.save(os.path.join(OUT_DIR, OUT_FILE))
+    print("entry written to", os.path.join(OUT_DIR, OUT_FILE))
 
 
 if __name__ == "__main__":
